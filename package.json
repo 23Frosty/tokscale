@@ -8,12 +8,12 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "cargo build --release -p tokscale-cli && bun run build:cli",
-    "build:cli": "bun run --cwd packages/cli build",
+    "build": "cargo build --release -p tokscale-cli && npm run build:cli",
+    "build:cli": "npm run -w @tokscale/cli build",
     "build:core": "cargo build --release -p tokscale-cli",
     "cli": "./scripts/cli.sh",
-    "dev:frontend": "bun run --cwd packages/frontend dev",
-    "dev:benchmarks": "bun run --cwd packages/benchmarks run",
+    "dev:frontend": "npm run -w @tokscale/frontend dev",
+    "dev:benchmarks": "npm run -w @tokscale/benchmarks run",
     "test:launchers": "bash scripts/test-package-launchers.sh"
   },
   "devDependencies": {
