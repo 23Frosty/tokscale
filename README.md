@@ -166,6 +166,9 @@ bunx tokscale@latest
 # Or use deno dx
 dx tokscale@latest
 
+# Or run a specific GitHub branch (for testing unreleased changes)
+dx jsr:@deno/gh/junhoyeo/tokscale#<branch-name>
+
 # Light mode (table rendering only)
 npx tokscale@latest --light
 ```
@@ -174,6 +177,30 @@ That's it! This gives you the full interactive TUI experience with zero setup.
 
 > **Package Structure**: `tokscale` is an alias package (like [`swc`](https://www.npmjs.com/package/swc)) that installs `@tokscale/cli`. Both install the same CLI with the native Rust core (`@tokscale/core`) included.
 
+
+### Installing from a GitHub branch with Deno
+
+If you want Deno to use your branch instead of the npm `latest` release, run through GitHub with `jsr:@deno/gh` and pin the branch name:
+
+```bash
+# Run directly from a branch
+dx jsr:@deno/gh/junhoyeo/tokscale#<branch-name> -- --version
+
+# Optionally alias it to a local command name
+deno install -g -A -n tokscale-branch jsr:@deno/gh/junhoyeo/tokscale#<branch-name>
+```
+
+If you already installed the npm release on your system and want to avoid calling that binary by accident, uninstall it first:
+
+```bash
+# Remove previous Deno-installed command (if present)
+deno uninstall tokscale
+
+# Reinstall pointing at your branch
+deno install -g -A -n tokscale jsr:@deno/gh/junhoyeo/tokscale#<branch-name>
+```
+
+> **Tip**: Replace `<branch-name>` with the real branch name (for example `feat/my-change`). Use `#main` to match main explicitly.
 
 ### Prerequisites
 
