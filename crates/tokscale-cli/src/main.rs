@@ -139,6 +139,21 @@ enum Commands {
         #[arg(long, help = "Disable spinner")]
         no_spinner: bool,
     },
+    #[command(about = "Show weekly usage report")]
+    Weekly {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        light: bool,
+        #[command(flatten)]
+        clients: ClientFlags,
+        #[command(flatten)]
+        date: DateRangeFlags,
+        #[arg(long, help = "Show processing time")]
+        benchmark: bool,
+        #[arg(long, help = "Disable spinner")]
+        no_spinner: bool,
+    },
     #[command(about = "Show hourly usage report")]
     Hourly {
         #[arg(long)]
@@ -423,6 +438,34 @@ fn main() -> Result<()> {
                     Some(Tab::Daily),
                 )
             }
+        }
+        Some(Commands::Weekly {
+            json,
+            light,
+            clients,
+            date,
+            benchmark,
+            no_spinner,
+        }) => {
+            let today = date.today;
+            let week = date.week;
+            let month = date.month;
+            let (since, until) = build_date_filter(today, week, month, date.since, date.until);
+            let year = normalize_year_filter(today, week, month, date.year);
+            let clients = build_client_filter(clients);
+            run_weekly_report(
+                json || light,
+                cli.home.clone(),
+                clients,
+                since,
+                until,
+                year,
+                benchmark,
+                no_spinner || !can_use_tui,
+                today,
+                week,
+                month,
+            )
         }
         Some(Commands::Hourly {
             json,
@@ -2530,6 +2573,171 @@ fn run_hourly_report(
         }
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_weekly_report(
+    json: bool,
+    home_dir: Option<String>,
+    clients: Option<Vec<String>>,
+    since: Option<String>,
+    until: Option<String>,
+    year: Option<String>,
+    benchmark: bool,
+    no_spinner: bool,
+    today: bool,
+    week: bool,
+    month_flag: bool,
+) -> Result<()> {
+    use chrono::{Datelike, NaiveDate};
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+    use tokio::runtime::Runtime;
+    use tokscale_core::{generate_local_graph_report, ReportOptions};
+
+    #[derive(Default)]
+    struct WeeklyAgg {
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        messages: i32,
+        cost: f64,
+    }
+
+    let date_range = get_date_range_label(today, week, month_flag, &since, &until, &year);
+    let spinner = if no_spinner {
+        None
+    } else {
+        Some(LightSpinner::start("Scanning session data..."))
+    };
+    let use_env_roots = use_env_roots(&home_dir);
+    let start = Instant::now();
+    let rt = Runtime::new()?;
+    let graph = rt
+        .block_on(async {
+            generate_local_graph_report(ReportOptions {
+                home_dir,
+                use_env_roots,
+                clients,
+                since,
+                until,
+                year,
+                group_by: tokscale_core::GroupBy::default(),
+                scanner_settings: tui::settings::load_scanner_settings(),
+            })
+            .await
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(spinner) = spinner {
+        spinner.stop();
+    }
+
+    let mut weekly: BTreeMap<String, WeeklyAgg> = BTreeMap::new();
+    for day in graph.contributions {
+        let Ok(date) = NaiveDate::parse_from_str(&day.date, "%Y-%m-%d") else {
+            continue;
+        };
+        let iso = date.iso_week();
+        let key = format!("{}-W{:02}", iso.year(), iso.week());
+        let entry = weekly.entry(key).or_default();
+        entry.input += day.token_breakdown.input;
+        entry.output += day.token_breakdown.output;
+        entry.cache_read += day.token_breakdown.cache_read;
+        entry.cache_write += day.token_breakdown.cache_write;
+        entry.messages += day.totals.messages;
+        entry.cost += day.totals.cost;
+    }
+
+    let mut entries: Vec<_> = weekly.into_iter().collect();
+    entries.reverse();
+    let total_cost: f64 = entries.iter().map(|(_, w)| w.cost).sum();
+    let processing_time_ms = start.elapsed().as_millis();
+
+    if json {
+        let output: Vec<_> = entries
+            .iter()
+            .map(|(week, w)| serde_json::json!({
+                "week": week, "input": w.input, "output": w.output, "cacheRead": w.cache_read, "cacheWrite": w.cache_write, "messageCount": w.messages, "cost": w.cost
+            }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "entries": output,
+                "totalCost": total_cost,
+                "processingTimeMs": processing_time_ms
+            }))?
+        );
+        return Ok(());
+    }
+
+    use comfy_table::{Attribute, Cell, CellAlignment, Color, Table};
+    let mut table = Table::new();
+    table.load_preset(TABLE_PRESET);
+    table.set_header(vec![
+        Cell::new("Week").fg(Color::Cyan),
+        Cell::new("Input").fg(Color::Cyan),
+        Cell::new("Output").fg(Color::Cyan),
+        Cell::new("Cache Write").fg(Color::Cyan),
+        Cell::new("Cache Read").fg(Color::Cyan),
+        Cell::new("Total").fg(Color::Cyan),
+        Cell::new("Cost").fg(Color::Cyan),
+    ]);
+    for (week_key, w) in &entries {
+        let total = w.input + w.output + w.cache_write + w.cache_read;
+        table.add_row(vec![
+            Cell::new(week_key),
+            Cell::new(format_tokens_with_commas(w.input)).set_alignment(CellAlignment::Right),
+            Cell::new(format_tokens_with_commas(w.output)).set_alignment(CellAlignment::Right),
+            Cell::new(format_tokens_with_commas(w.cache_write)).set_alignment(CellAlignment::Right),
+            Cell::new(format_tokens_with_commas(w.cache_read)).set_alignment(CellAlignment::Right),
+            Cell::new(format_tokens_with_commas(total)).set_alignment(CellAlignment::Right),
+            Cell::new(format_currency(w.cost)).set_alignment(CellAlignment::Right),
+        ]);
+    }
+    let total_input: i64 = entries.iter().map(|(_, w)| w.input).sum();
+    let total_output: i64 = entries.iter().map(|(_, w)| w.output).sum();
+    let total_cache_write: i64 = entries.iter().map(|(_, w)| w.cache_write).sum();
+    let total_cache_read: i64 = entries.iter().map(|(_, w)| w.cache_read).sum();
+    let total_all = total_input + total_output + total_cache_write + total_cache_read;
+    table.add_row(vec![
+        Cell::new("Total")
+            .fg(Color::Yellow)
+            .add_attribute(Attribute::Bold),
+        Cell::new(format_tokens_with_commas(total_input))
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_tokens_with_commas(total_output))
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_tokens_with_commas(total_cache_write))
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_tokens_with_commas(total_cache_read))
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_tokens_with_commas(total_all))
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_currency(total_cost))
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+    ]);
+    let title = match &date_range {
+        Some(range) => format!("Weekly Token Usage Report ({})", range),
+        None => "Weekly Token Usage Report".to_string(),
+    };
+    println!("\n  \x1b[36m{}\x1b[0m\n", title);
+    println!("{}", dim_borders(&table.to_string()));
+    if benchmark {
+        use colored::Colorize;
+        println!(
+            "{}",
+            format!("  Processing time: {}ms (Rust native)", processing_time_ms).bright_black()
+        );
+    }
     Ok(())
 }
 
