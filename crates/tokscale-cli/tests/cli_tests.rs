@@ -454,6 +454,16 @@ fn test_monthly_command_help() {
 }
 
 #[test]
+fn test_weekly_command_help() {
+    let mut cmd = cargo_bin_cmd!("tokscale");
+    cmd.arg("weekly")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Show weekly usage report"));
+}
+
+#[test]
 fn test_pricing_command_help() {
     let mut cmd = cargo_bin_cmd!("tokscale");
     cmd.arg("pricing")
