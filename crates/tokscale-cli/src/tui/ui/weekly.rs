@@ -34,7 +34,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let is_narrow = app.is_narrow();
+    let is_narrow = app.is_narrow() || area.width < 104;
     let is_very_narrow = app.is_very_narrow();
     let has_turn_data = weekly.iter().any(|w| w.turn_count > 0);
     let sort_field = app.sort_field;

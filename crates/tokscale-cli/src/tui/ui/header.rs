@@ -4,12 +4,12 @@ use ratatui::widgets::{Block, Borders, Tabs};
 use crate::tui::app::{App, ClickAction, Tab};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
-    let is_very_narrow = app.is_very_narrow();
+    let use_short_names = area.width < 96;
 
     let titles: Vec<Line> = Tab::all()
         .iter()
         .map(|t| {
-            let name = if is_very_narrow {
+            let name = if use_short_names {
                 t.short_name()
             } else {
                 t.as_str()
@@ -70,13 +70,13 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn register_tab_click_areas(app: &mut App, area: Rect) {
-    let is_very_narrow = app.is_very_narrow();
+    let use_short_names = area.width < 96;
     let inner_x = area.x + 12;
     let y = area.y + 1;
     let mut x = inner_x;
 
     for tab in Tab::all() {
-        let name_len = if is_very_narrow {
+        let name_len = if use_short_names {
             tab.short_name().len()
         } else {
             tab.as_str().len()
