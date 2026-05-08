@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'echo "Launcher smoke tests failed at line ${LINENO}" >&2' ERR
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
-
-if ! command -v bun >/dev/null 2>&1; then
-  echo "bun is required for launcher smoke tests" >&2
-  exit 1
-fi
 
 if ! command -v node >/dev/null 2>&1; then
   echo "node is required for launcher smoke tests" >&2
   exit 1
 fi
 
-BUN_BIN="${BUN_BIN:-$(command -v bun)}"
+if ! command -v npm >/dev/null 2>&1; then
+  echo "npm is required for launcher smoke tests" >&2
+  exit 1
+fi
+
+if ! command -v tar >/dev/null 2>&1; then
+  echo "tar is required for launcher smoke tests" >&2
+  exit 1
+fi
+
+BUN_BIN="${BUN_BIN:-$(command -v bun || true)}"
 NODE_BIN="${NODE_BIN:-$(command -v node)}"
+NPM_BIN="${NPM_BIN:-$(command -v npm)}"
 LDD_BIN="${LDD_BIN:-$(command -v ldd || true)}"
 
 PLATFORM_PACKAGE="$(node --input-type=module <<'NODE'
@@ -72,7 +79,7 @@ if [[ -z "${PLATFORM_PACKAGE}" ]]; then
 fi
 
 echo "Building CLI wrapper and native binary..."
-bun run --cwd packages/cli build >/dev/null
+env -u npm_config_workspace -u npm_config_workspaces npm run -w @tokscale/cli build >/dev/null
 cargo build --release -p tokscale-cli >/dev/null
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tokscale-launcher-smoke.XXXXXX")"
@@ -89,6 +96,7 @@ NPM_CACHE="${TMP_ROOT}/npm-cache"
 EMPTY_PATH_DIR="${TMP_ROOT}/empty-path"
 BUN_ONLY_DIR="${TMP_ROOT}/bun-only-path"
 NODE_ONLY_DIR="${TMP_ROOT}/node-only-path"
+NPM_ONLY_DIR="${TMP_ROOT}/npm-only-path"
 
 cp -R packages/cli "${CLI_STAGE}"
 cp -R packages/tokscale "${WRAPPER_STAGE}"
@@ -99,32 +107,47 @@ mkdir -p \
   "${NPM_CACHE}" \
   "${EMPTY_PATH_DIR}" \
   "${BUN_ONLY_DIR}" \
-  "${NODE_ONLY_DIR}"
+  "${NODE_ONLY_DIR}" \
+  "${NPM_ONLY_DIR}"
 cp target/release/tokscale "${PLATFORM_STAGE}/bin/tokscale"
 
 chmod +x "${CLI_STAGE}/bin.js" "${WRAPPER_STAGE}/bin.js" "${PLATFORM_STAGE}/bin/tokscale"
 
-ln -s "${BUN_BIN}" "${BUN_ONLY_DIR}/bun"
+if [[ -n "${BUN_BIN}" ]]; then
+  ln -s "${BUN_BIN}" "${BUN_ONLY_DIR}/bun"
+fi
 ln -s "${NODE_BIN}" "${NODE_ONLY_DIR}/node"
+ln -s "${NODE_BIN}" "${NPM_ONLY_DIR}/node"
+ln -s "${NPM_BIN}" "${NPM_ONLY_DIR}/npm"
 if [[ -n "${LDD_BIN}" ]]; then
   ln -s "${LDD_BIN}" "${BUN_ONLY_DIR}/ldd"
   ln -s "${LDD_BIN}" "${NODE_ONLY_DIR}/ldd"
+  ln -s "${LDD_BIN}" "${NPM_ONLY_DIR}/ldd"
 fi
 
 BUN_ONLY_PATH="${BUN_ONLY_DIR}"
 NODE_ONLY_PATH="${NODE_ONLY_DIR}"
+NPM_ONLY_PATH="${NPM_ONLY_DIR}"
 
-CLI_TGZ="$(cd "${CLI_STAGE}" && NPM_CONFIG_CACHE="${NPM_CACHE}" npm pack --silent)"
-WRAPPER_TGZ="$(cd "${WRAPPER_STAGE}" && NPM_CONFIG_CACHE="${NPM_CACHE}" npm pack --silent)"
-PLATFORM_TGZ="$(cd "${PLATFORM_STAGE}" && NPM_CONFIG_CACHE="${NPM_CACHE}" npm pack --silent)"
+CLI_TGZ="$(cd "${CLI_STAGE}" && env -u npm_config_workspace -u npm_config_workspaces NPM_CONFIG_CACHE="${NPM_CACHE}" npm pack --silent)"
+WRAPPER_TGZ="$(cd "${WRAPPER_STAGE}" && env -u npm_config_workspace -u npm_config_workspaces NPM_CONFIG_CACHE="${NPM_CACHE}" npm pack --silent)"
+PLATFORM_TGZ="$(cd "${PLATFORM_STAGE}" && env -u npm_config_workspace -u npm_config_workspaces NPM_CONFIG_CACHE="${NPM_CACHE}" npm pack --silent)"
 
-echo "Installing local tarballs with Bun..."
+echo "Installing local tarballs..."
 (
   cd "${INSTALL_DIR}"
-  env PATH="${BUN_ONLY_PATH}" bun add \
-    "${CLI_STAGE}/${CLI_TGZ}" \
-    "${WRAPPER_STAGE}/${WRAPPER_TGZ}" \
-    "${PLATFORM_STAGE}/${PLATFORM_TGZ}" >/dev/null
+  if [[ -n "${BUN_BIN}" ]]; then
+    env PATH="${BUN_ONLY_PATH}" bun add \
+      "${CLI_STAGE}/${CLI_TGZ}" \
+      "${WRAPPER_STAGE}/${WRAPPER_TGZ}" \
+      "${PLATFORM_STAGE}/${PLATFORM_TGZ}" >/dev/null
+  else
+    mkdir -p node_modules/@tokscale/cli node_modules/@tokscale/"${PLATFORM_PACKAGE}" node_modules/tokscale node_modules/.bin
+    tar -xzf "${CLI_STAGE}/${CLI_TGZ}" -C node_modules/@tokscale/cli --strip-components=1
+    tar -xzf "${WRAPPER_STAGE}/${WRAPPER_TGZ}" -C node_modules/tokscale --strip-components=1
+    tar -xzf "${PLATFORM_STAGE}/${PLATFORM_TGZ}" -C node_modules/@tokscale/"${PLATFORM_PACKAGE}" --strip-components=1
+    ln -s ../tokscale/bin.js node_modules/.bin/tokscale
+  fi
 )
 
 INSTALLED_BIN="${INSTALL_DIR}/node_modules/.bin/tokscale"
@@ -136,12 +159,14 @@ fi
 echo "Checking source-tree wrapper with Node-only PATH..."
 env PATH="${NODE_ONLY_PATH}" "${ROOT_DIR}/packages/tokscale/bin.js" --version >/dev/null
 
-echo "Checking installed launcher via Bun runtime..."
-INSTALLED_VERSION_BUN="$(env PATH="${BUN_ONLY_PATH}" bun "${INSTALLED_BIN}" --version)"
-[[ "${INSTALLED_VERSION_BUN}" == tokscale* ]] || {
-  echo "Unexpected Bun launcher output: ${INSTALLED_VERSION_BUN}" >&2
-  exit 1
-}
+if [[ -n "${BUN_BIN}" ]]; then
+  echo "Checking installed launcher via Bun runtime..."
+  INSTALLED_VERSION_BUN="$(env PATH="${BUN_ONLY_PATH}" bun "${INSTALLED_BIN}" --version)"
+  [[ "${INSTALLED_VERSION_BUN}" == tokscale* ]] || {
+    echo "Unexpected Bun launcher output: ${INSTALLED_VERSION_BUN}" >&2
+    exit 1
+  }
+fi
 
 echo "Checking installed launcher with Node-only PATH..."
 INSTALLED_VERSION_NODE="$(env PATH="${NODE_ONLY_PATH}" "${INSTALLED_BIN}" --version)"
@@ -152,8 +177,10 @@ INSTALLED_VERSION_NODE="$(env PATH="${NODE_ONLY_PATH}" "${INSTALLED_BIN}" --vers
 
 echo "Checking error path with no Node/Bun in PATH..."
 set +e
+trap - ERR
 ERROR_OUTPUT="$(env PATH="${EMPTY_PATH_DIR}" "${INSTALLED_BIN}" --version 2>&1)"
 ERROR_CODE=$?
+trap 'echo "Launcher smoke tests failed at line ${LINENO}" >&2' ERR
 set -e
 if [[ ${ERROR_CODE} -eq 0 ]]; then
   echo "Expected launcher to fail when neither Node nor Bun is available" >&2

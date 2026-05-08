@@ -1398,6 +1398,10 @@ fn rpc_request(connection: &AntigravityConnection, method: &str, body: &Value) -
     stream.write_all(request.as_bytes())?;
 
     let mut reader = BufReader::new(stream);
+    read_rpc_response(&mut reader, method)
+}
+
+fn read_rpc_response<R: Read>(reader: &mut BufReader<R>, method: &str) -> Result<Value> {
     let mut status_line = String::new();
     reader.read_line(&mut status_line)?;
 
@@ -1436,7 +1440,7 @@ fn rpc_request(connection: &AntigravityConnection, method: &str, body: &Value) -
         reader.read_exact(&mut bytes)?;
         String::from_utf8(bytes)?
     } else if chunked {
-        read_chunked_body(&mut reader)?
+        read_chunked_body(&mut *reader)?
     } else {
         let mut text = String::new();
         reader
@@ -1464,7 +1468,7 @@ fn rpc_request(connection: &AntigravityConnection, method: &str, body: &Value) -
     Ok(serde_json::from_str(&response_body)?)
 }
 
-fn read_chunked_body(reader: &mut BufReader<TcpStream>) -> Result<String> {
+fn read_chunked_body<R: Read>(reader: &mut BufReader<R>) -> Result<String> {
     let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
@@ -1812,6 +1816,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
+    use std::io::Cursor;
 
     /// RAII guard that redirects every tokscale config-dir lookup into a
     /// caller-supplied directory and restores the previous environment on
@@ -2212,40 +2217,23 @@ mod tests {
         assert!(!artifact_path.exists());
     }
 
-    use std::net::TcpListener;
-    use std::thread;
-
-    fn serve_once(body: Vec<u8>, headers_extra: &str) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let header_owned = headers_extra.to_string();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = std::io::Read::read(&mut stream, &mut buf);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n{}Connection: close\r\n\r\n",
-                header_owned
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.write_all(&body);
-        });
-        port
+    fn rpc_response(body: Vec<u8>, headers_extra: &str) -> BufReader<Cursor<Vec<u8>>> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\n{}Connection: close\r\n\r\n",
+            headers_extra
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        BufReader::new(Cursor::new(response))
     }
 
     #[test]
     fn rpc_request_rejects_oversized_content_length_body() {
-        let port = serve_once(
+        let mut response = rpc_response(
             vec![b'a'; 32],
             &format!("Content-Length: {}\r\n", MAX_RPC_BODY_BYTES + 1),
         );
-        let connection = AntigravityConnection {
-            pid: 1,
-            port,
-            csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
-            fingerprint: format!("pid:1:port:{port}"),
-        };
-        let err = rpc_request(&connection, "X", &serde_json::json!({})).unwrap_err();
+        let err = read_rpc_response(&mut response, "X").unwrap_err();
         assert!(
             err.to_string().contains("exceeds"),
             "expected cap error, got: {err:#}"
@@ -2262,14 +2250,8 @@ mod tests {
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(b"0\r\n\r\n");
-        let port = serve_once(body, "Transfer-Encoding: chunked\r\n");
-        let connection = AntigravityConnection {
-            pid: 1,
-            port,
-            csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
-            fingerprint: format!("pid:1:port:{port}"),
-        };
-        let err = rpc_request(&connection, "X", &serde_json::json!({})).unwrap_err();
+        let mut response = rpc_response(body, "Transfer-Encoding: chunked\r\n");
+        let err = read_rpc_response(&mut response, "X").unwrap_err();
         assert!(
             err.to_string().contains("exceeds"),
             "expected cap error, got: {err:#}"

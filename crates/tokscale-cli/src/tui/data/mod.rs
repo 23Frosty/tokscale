@@ -101,6 +101,28 @@ pub struct DailyUsage {
 }
 
 #[derive(Debug, Clone)]
+pub struct WeeklyUsage {
+    pub week: String,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub message_count: u32,
+    pub turn_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MonthlyUsage {
+    pub month: String,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub message_count: u32,
+    pub turn_count: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct HourlyModelInfo {
     pub provider: String,
     pub display_name: String,

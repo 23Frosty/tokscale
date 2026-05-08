@@ -1,9 +1,10 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use tokscale_core::ClientId;
@@ -12,7 +13,10 @@ use crate::ClientFilter;
 
 use ratatui::style::Color;
 
-use super::data::{AgentUsage, DailyUsage, DataLoader, HourlyUsage, ModelUsage, UsageData};
+use super::data::{
+    AgentUsage, DailyUsage, DataLoader, HourlyUsage, ModelUsage, MonthlyUsage, TokenBreakdown,
+    UsageData, WeeklyUsage,
+};
 use super::settings::Settings;
 use super::themes::{Theme, ThemeName};
 use super::ui::dialog::{ClientPickerDialog, DialogStack};
@@ -35,6 +39,8 @@ pub enum Tab {
     Overview,
     Models,
     Daily,
+    Weekly,
+    Monthly,
     Hourly,
     Stats,
     Agents,
@@ -46,6 +52,8 @@ impl Tab {
             Tab::Overview,
             Tab::Models,
             Tab::Daily,
+            Tab::Weekly,
+            Tab::Monthly,
             Tab::Hourly,
             Tab::Stats,
             Tab::Agents,
@@ -57,6 +65,8 @@ impl Tab {
             Tab::Overview => "Overview",
             Tab::Models => "Models",
             Tab::Daily => "Daily",
+            Tab::Weekly => "Weekly",
+            Tab::Monthly => "Monthly",
             Tab::Hourly => "Hourly",
             Tab::Stats => "Stats",
             Tab::Agents => "Agents",
@@ -68,6 +78,8 @@ impl Tab {
             Tab::Overview => "Ovw",
             Tab::Models => "Mod",
             Tab::Daily => "Day",
+            Tab::Weekly => "Wk",
+            Tab::Monthly => "Mon",
             Tab::Hourly => "Hr",
             Tab::Stats => "Sta",
             Tab::Agents => "Agt",
@@ -78,7 +90,9 @@ impl Tab {
         match self {
             Tab::Overview => Tab::Models,
             Tab::Models => Tab::Daily,
-            Tab::Daily => Tab::Hourly,
+            Tab::Daily => Tab::Weekly,
+            Tab::Weekly => Tab::Monthly,
+            Tab::Monthly => Tab::Hourly,
             Tab::Hourly => Tab::Stats,
             Tab::Stats => Tab::Agents,
             Tab::Agents => Tab::Overview,
@@ -90,7 +104,9 @@ impl Tab {
             Tab::Overview => Tab::Agents,
             Tab::Models => Tab::Overview,
             Tab::Daily => Tab::Models,
-            Tab::Hourly => Tab::Daily,
+            Tab::Weekly => Tab::Daily,
+            Tab::Monthly => Tab::Weekly,
+            Tab::Hourly => Tab::Monthly,
             Tab::Stats => Tab::Hourly,
             Tab::Agents => Tab::Stats,
         }
@@ -581,15 +597,16 @@ impl App {
 
         self.current_tab = target;
 
-        let (field, dir) =
-            self.tab_sort_state
-                .get(&target)
-                .copied()
-                .unwrap_or(if target == Tab::Hourly {
-                    (SortField::Date, SortDirection::Descending)
-                } else {
-                    (SortField::Cost, SortDirection::Descending)
-                });
+        let (field, dir) = self.tab_sort_state.get(&target).copied().unwrap_or(
+            if matches!(
+                target,
+                Tab::Daily | Tab::Weekly | Tab::Monthly | Tab::Hourly
+            ) {
+                (SortField::Date, SortDirection::Descending)
+            } else {
+                (SortField::Cost, SortDirection::Descending)
+            },
+        );
         self.sort_field = field;
         self.sort_direction = dir;
     }
@@ -706,6 +723,8 @@ impl App {
             Tab::Overview | Tab::Models => self.data.models.len(),
             Tab::Agents => self.data.agents.len(),
             Tab::Daily => self.data.daily.len(),
+            Tab::Weekly => self.get_sorted_weekly().len(),
+            Tab::Monthly => self.get_sorted_monthly().len(),
             Tab::Hourly => self.data.hourly.len(),
             Tab::Stats => {
                 if self.selected_graph_cell.is_some() {
@@ -886,6 +905,14 @@ impl App {
                 .get_sorted_daily()
                 .get(self.selected_index)
                 .map(|d| format!("{}: {} tokens, ${:.4}", d.date, d.tokens.total(), d.cost)),
+            Tab::Weekly => self
+                .get_sorted_weekly()
+                .get(self.selected_index)
+                .map(|w| format!("{}: {} tokens, ${:.4}", w.week, w.tokens.total(), w.cost)),
+            Tab::Monthly => self
+                .get_sorted_monthly()
+                .get(self.selected_index)
+                .map(|m| format!("{}: {} tokens, ${:.4}", m.month, m.tokens.total(), m.cost)),
             Tab::Hourly => self.get_sorted_hourly().get(self.selected_index).map(|h| {
                 format!(
                     "{}: {} tokens, ${:.4}",
@@ -1037,6 +1064,152 @@ impl App {
         daily
     }
 
+    pub fn get_sorted_weekly(&self) -> Vec<WeeklyUsage> {
+        let mut weekly_map: BTreeMap<String, WeeklyUsage> = BTreeMap::new();
+
+        for day in &self.data.daily {
+            let iso = day.date.iso_week();
+            let week_start =
+                day.date - ChronoDuration::days(day.date.weekday().num_days_from_monday() as i64);
+            let week_end = week_start + ChronoDuration::days(6);
+            let entry = weekly_map
+                .entry(format!("{}-W{:02}", iso.year(), iso.week()))
+                .or_insert_with(|| WeeklyUsage {
+                    week: format!("{}-W{:02}", iso.year(), iso.week()),
+                    start_date: week_start,
+                    end_date: week_end,
+                    tokens: TokenBreakdown::default(),
+                    cost: 0.0,
+                    message_count: 0,
+                    turn_count: 0,
+                });
+
+            entry.tokens.input = entry.tokens.input.saturating_add(day.tokens.input);
+            entry.tokens.output = entry.tokens.output.saturating_add(day.tokens.output);
+            entry.tokens.cache_read = entry
+                .tokens
+                .cache_read
+                .saturating_add(day.tokens.cache_read);
+            entry.tokens.cache_write = entry
+                .tokens
+                .cache_write
+                .saturating_add(day.tokens.cache_write);
+            entry.tokens.reasoning = entry.tokens.reasoning.saturating_add(day.tokens.reasoning);
+            entry.cost += day.cost;
+            entry.message_count = entry.message_count.saturating_add(day.message_count);
+            entry.turn_count = entry.turn_count.saturating_add(day.turn_count);
+        }
+
+        let mut weekly: Vec<WeeklyUsage> = weekly_map.into_values().collect();
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => weekly.sort_by(|a, b| {
+                b.cost
+                    .total_cmp(&a.cost)
+                    .then_with(|| b.start_date.cmp(&a.start_date))
+            }),
+            (SortField::Cost, SortDirection::Ascending) => weekly.sort_by(|a, b| {
+                a.cost
+                    .total_cmp(&b.cost)
+                    .then_with(|| b.start_date.cmp(&a.start_date))
+            }),
+            (SortField::Tokens, SortDirection::Descending) => weekly.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| b.start_date.cmp(&a.start_date))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => weekly.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| b.start_date.cmp(&a.start_date))
+            }),
+            (SortField::Date, SortDirection::Descending) => {
+                weekly.sort_by_key(|w| std::cmp::Reverse(w.start_date))
+            }
+            (SortField::Date, SortDirection::Ascending) => weekly.sort_by_key(|w| w.start_date),
+        }
+
+        weekly
+    }
+
+    pub fn get_sorted_monthly(&self) -> Vec<MonthlyUsage> {
+        let mut monthly_map: BTreeMap<String, MonthlyUsage> = BTreeMap::new();
+
+        for day in &self.data.daily {
+            let month_key = format!("{}-{:02}", day.date.year(), day.date.month());
+            let start_date =
+                NaiveDate::from_ymd_opt(day.date.year(), day.date.month(), 1).unwrap_or(day.date);
+            let (next_year, next_month) = if day.date.month() == 12 {
+                (day.date.year() + 1, 1)
+            } else {
+                (day.date.year(), day.date.month() + 1)
+            };
+            let end_date = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+                .map(|d| d - ChronoDuration::days(1))
+                .unwrap_or(day.date);
+
+            let entry = monthly_map
+                .entry(month_key.clone())
+                .or_insert_with(|| MonthlyUsage {
+                    month: month_key,
+                    start_date,
+                    end_date,
+                    tokens: TokenBreakdown::default(),
+                    cost: 0.0,
+                    message_count: 0,
+                    turn_count: 0,
+                });
+
+            entry.tokens.input = entry.tokens.input.saturating_add(day.tokens.input);
+            entry.tokens.output = entry.tokens.output.saturating_add(day.tokens.output);
+            entry.tokens.cache_read = entry
+                .tokens
+                .cache_read
+                .saturating_add(day.tokens.cache_read);
+            entry.tokens.cache_write = entry
+                .tokens
+                .cache_write
+                .saturating_add(day.tokens.cache_write);
+            entry.tokens.reasoning = entry.tokens.reasoning.saturating_add(day.tokens.reasoning);
+            entry.cost += day.cost;
+            entry.message_count = entry.message_count.saturating_add(day.message_count);
+            entry.turn_count = entry.turn_count.saturating_add(day.turn_count);
+        }
+
+        let mut monthly: Vec<MonthlyUsage> = monthly_map.into_values().collect();
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => monthly.sort_by(|a, b| {
+                b.cost
+                    .total_cmp(&a.cost)
+                    .then_with(|| b.start_date.cmp(&a.start_date))
+            }),
+            (SortField::Cost, SortDirection::Ascending) => monthly.sort_by(|a, b| {
+                a.cost
+                    .total_cmp(&b.cost)
+                    .then_with(|| b.start_date.cmp(&a.start_date))
+            }),
+            (SortField::Tokens, SortDirection::Descending) => monthly.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| b.start_date.cmp(&a.start_date))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => monthly.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| b.start_date.cmp(&a.start_date))
+            }),
+            (SortField::Date, SortDirection::Descending) => {
+                monthly.sort_by_key(|m| std::cmp::Reverse(m.start_date))
+            }
+            (SortField::Date, SortDirection::Ascending) => monthly.sort_by_key(|m| m.start_date),
+        }
+
+        monthly
+    }
+
     pub fn get_sorted_hourly(&self) -> Vec<&HourlyUsage> {
         let mut hourly: Vec<&HourlyUsage> = self.data.hourly.iter().collect();
 
@@ -1090,20 +1263,24 @@ mod tests {
     #[test]
     fn test_tab_all() {
         let tabs = Tab::all();
-        assert_eq!(tabs.len(), 6);
+        assert_eq!(tabs.len(), 8);
         assert_eq!(tabs[0], Tab::Overview);
         assert_eq!(tabs[1], Tab::Models);
         assert_eq!(tabs[2], Tab::Daily);
-        assert_eq!(tabs[3], Tab::Hourly);
-        assert_eq!(tabs[4], Tab::Stats);
-        assert_eq!(tabs[5], Tab::Agents);
+        assert_eq!(tabs[3], Tab::Weekly);
+        assert_eq!(tabs[4], Tab::Monthly);
+        assert_eq!(tabs[5], Tab::Hourly);
+        assert_eq!(tabs[6], Tab::Stats);
+        assert_eq!(tabs[7], Tab::Agents);
     }
 
     #[test]
     fn test_tab_next() {
         assert_eq!(Tab::Overview.next(), Tab::Models);
         assert_eq!(Tab::Models.next(), Tab::Daily);
-        assert_eq!(Tab::Daily.next(), Tab::Hourly);
+        assert_eq!(Tab::Daily.next(), Tab::Weekly);
+        assert_eq!(Tab::Weekly.next(), Tab::Monthly);
+        assert_eq!(Tab::Monthly.next(), Tab::Hourly);
         assert_eq!(Tab::Hourly.next(), Tab::Stats);
         assert_eq!(Tab::Stats.next(), Tab::Agents);
         assert_eq!(Tab::Agents.next(), Tab::Overview);
@@ -1114,7 +1291,9 @@ mod tests {
         assert_eq!(Tab::Overview.prev(), Tab::Agents);
         assert_eq!(Tab::Models.prev(), Tab::Overview);
         assert_eq!(Tab::Daily.prev(), Tab::Models);
-        assert_eq!(Tab::Hourly.prev(), Tab::Daily);
+        assert_eq!(Tab::Weekly.prev(), Tab::Daily);
+        assert_eq!(Tab::Monthly.prev(), Tab::Weekly);
+        assert_eq!(Tab::Hourly.prev(), Tab::Monthly);
         assert_eq!(Tab::Stats.prev(), Tab::Hourly);
         assert_eq!(Tab::Agents.prev(), Tab::Stats);
     }
@@ -1125,6 +1304,9 @@ mod tests {
         assert_eq!(Tab::Models.as_str(), "Models");
         assert_eq!(Tab::Agents.as_str(), "Agents");
         assert_eq!(Tab::Daily.as_str(), "Daily");
+        assert_eq!(Tab::Weekly.as_str(), "Weekly");
+        assert_eq!(Tab::Monthly.as_str(), "Monthly");
+        assert_eq!(Tab::Hourly.as_str(), "Hourly");
         assert_eq!(Tab::Stats.as_str(), "Stats");
     }
 
@@ -1134,6 +1316,9 @@ mod tests {
         assert_eq!(Tab::Models.short_name(), "Mod");
         assert_eq!(Tab::Agents.short_name(), "Agt");
         assert_eq!(Tab::Daily.short_name(), "Day");
+        assert_eq!(Tab::Weekly.short_name(), "Wk");
+        assert_eq!(Tab::Monthly.short_name(), "Mon");
+        assert_eq!(Tab::Hourly.short_name(), "Hr");
         assert_eq!(Tab::Stats.short_name(), "Sta");
     }
 
@@ -1440,6 +1625,12 @@ mod tests {
         assert_eq!(app.current_tab, Tab::Daily);
 
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Weekly);
+
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Monthly);
+
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.current_tab, Tab::Hourly);
 
         app.handle_key_event(key(KeyCode::Tab));
@@ -1465,6 +1656,12 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Hourly);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Monthly);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Weekly);
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Daily);
@@ -1635,7 +1832,16 @@ mod tests {
         assert_eq!(app.sort_direction, SortDirection::Descending);
 
         app.switch_tab(Tab::Daily);
-        assert_eq!(app.sort_field, SortField::Cost);
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+
+        app.switch_tab(Tab::Weekly);
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+
+        app.switch_tab(Tab::Monthly);
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
 
         app.switch_tab(Tab::Models);
         assert_eq!(app.sort_field, SortField::Tokens);

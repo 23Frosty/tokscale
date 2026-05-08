@@ -118,6 +118,19 @@ function resolveRustTargetTriple(): string | null {
 
 const targetPackage = resolveTargetPackageName();
 const searchPaths: string[] = [];
+const rustTargetTriple = resolveRustTargetTriple();
+const isMonorepoDev =
+  existsSync(join(workspaceRoot, "Cargo.toml")) &&
+  existsSync(join(workspaceRoot, "crates", "tokscale-cli", "Cargo.toml"));
+
+if (isMonorepoDev) {
+  if (rustTargetTriple) {
+    searchPaths.push(
+      join(workspaceRoot, "target", rustTargetTriple, "release", binaryName),
+    );
+  }
+  searchPaths.push(join(workspaceRoot, "target", "release", binaryName));
+}
 
 if (targetPackage) {
   searchPaths.push(
@@ -133,15 +146,15 @@ if (targetPackage) {
   );
 }
 
-const rustTargetTriple = resolveRustTargetTriple();
-if (rustTargetTriple) {
+if (!isMonorepoDev && rustTargetTriple) {
   searchPaths.push(join(workspaceRoot, "target", rustTargetTriple, "release", binaryName));
 }
 
-searchPaths.push(
-  join(workspaceRoot, "target", "release", binaryName),
-  join(cliDir, "bin", binaryName),
-);
+if (!isMonorepoDev) {
+  searchPaths.push(join(workspaceRoot, "target", "release", binaryName));
+}
+
+searchPaths.push(join(cliDir, "bin", binaryName));
 
 let binary = searchPaths.find((p) => existsSync(p));
 
